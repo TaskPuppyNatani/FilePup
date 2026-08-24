@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filepup"
+version = "0.0.1"
+description = "Safety-first media file automation for Linux"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+filepupctl = "filepup.cli:main"
+filepupd = "filepup.daemon:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
