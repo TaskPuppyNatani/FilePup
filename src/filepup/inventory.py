@@ -8,6 +8,13 @@ from .jobs import JobFile, JobFileState
 VIDEO_EXTENSIONS = {
     ".mkv",
     ".mp4",
+    ".avi",
+    ".m4v",
+    ".mov",
+    ".wmv",
+    ".ts",
+    ".mpg",
+    ".mpeg",
 }
 
 EBOOK_EXTENSIONS = {
@@ -63,12 +70,15 @@ class InventoryEngine:
             records = [(root, Path(root.name), state, self._message_for(state))]
         else:
             records = []
-            for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            for path in sorted(
+                p for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+            ):
+                resolved = path.resolve()
                 state = self._state_for(path)
                 records.append(
                     (
-                        path.resolve(),
-                        path.resolve().relative_to(root),
+                        resolved,
+                        path.relative_to(root),
                         state,
                         self._message_for(state),
                     )
