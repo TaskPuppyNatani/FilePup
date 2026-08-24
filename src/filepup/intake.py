@@ -21,6 +21,10 @@ class IntakeEngine:
     This first implementation deliberately uses an atomic rename only. If
     Completed Torrents and Staging are on different filesystems, FilePup stops
     the job instead of silently falling back to copy-and-delete behavior.
+
+    Multi-file torrent directories are also refused for now. FilePup must gain
+    per-file inventory/state tracking before it is allowed to move files out of
+    a directory piecemeal.
     """
 
     def __init__(self, config: FilePupConfig, store: JobStore):
@@ -47,6 +51,12 @@ class IntakeEngine:
 
         if not source.exists():
             return self._attention(job, f"Source does not exist: {source}")
+
+        if source.is_dir():
+            return self._attention(
+                job,
+                "Directory torrent intake is not implemented yet; source preserved",
+            )
 
         # Never create a media mount path automatically. A missing Staging path
         # could mean the expected disk/share is not mounted.
