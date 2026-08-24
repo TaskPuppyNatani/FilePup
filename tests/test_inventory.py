@@ -119,7 +119,7 @@ def test_inventory_preserves_nested_relative_paths(tmp_path: Path) -> None:
     assert result.files[0].relative_path == Path("Season 03/Bluey.S03E12.mkv")
 
 
-def test_reinventory_replaces_stale_file_records(tmp_path: Path) -> None:
+def test_reinventory_replaces_stale_unprocessed_file_records(tmp_path: Path) -> None:
     source = tmp_path / "Bluey Season 3"
     source.mkdir()
     first = source / "Bluey.S03E12.mkv"
@@ -137,3 +137,43 @@ def test_reinventory_replaces_stale_file_records(tmp_path: Path) -> None:
     result = engine.inventory(job.id)
 
     assert [file.relative_path for file in result.files] == [Path("Bluey.S03E13.mkv")]
+
+
+def test_reinventory_preserves_staged_and_attention_history(tmp_path: Path) -> None:
+    source = tmp_path / "Bluey Season 3"
+    source.mkdir()
+    staged_source = source / "Bluey.S03E12.mkv"
+    failed_source = source / "Bluey.S03E13.mkv"
+    staged_source.write_bytes(b"episode-12")
+    failed_source.write_bytes(b"episode-13")
+
+    store = JobStore(tmp_path / "filepup.db")
+    job, _ = store.ingest(source)
+    engine = InventoryEngine(store)
+    initial = engine.inventory(job.id)
+    staged_record = next(file for file in initial.files if file.source_path == staged_source)
+    failed_record = next(file for file in initial.files if file.source_path == failed_source)
+
+    staged_destination = tmp_path / "Staging" / staged_source.name
+    staged_destination.parent.mkdir()
+    staged_destination.write_bytes(staged_source.read_bytes())
+    staged_source.unlink()
+    store.update_job_file(
+        staged_record.id,
+        state=JobFileState.STAGED,
+        staged_path=staged_destination,
+        status_message="Moved to Staging and verified",
+    )
+    store.update_job_file(
+        failed_record.id,
+        state=JobFileState.NEEDS_ATTENTION,
+        status_message="Destination conflict",
+    )
+
+    result = engine.inventory(job.id)
+    by_name = {file.relative_path.name: file for file in result.files}
+
+    assert by_name["Bluey.S03E12.mkv"].state is JobFileState.STAGED
+    assert by_name["Bluey.S03E12.mkv"].staged_path == staged_destination
+    assert by_name["Bluey.S03E13.mkv"].state is JobFileState.NEEDS_ATTENTION
+    assert by_name["Bluey.S03E13.mkv"].status_message == "Destination conflict"
