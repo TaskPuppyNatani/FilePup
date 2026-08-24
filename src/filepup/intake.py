@@ -5,7 +5,8 @@ from pathlib import Path
 
 from .config import FilePupConfig
 from .database import JobStore
-from .jobs import Job, JobState
+from .inventory import InventoryEngine
+from .jobs import Job, JobFileState, JobState
 
 
 @dataclass(frozen=True)
@@ -18,13 +19,11 @@ class IntakeResult:
 class IntakeEngine:
     """Move completed torrent content into Staging without overwriting anything.
 
-    This first implementation deliberately uses an atomic rename only. If
-    Completed Torrents and Staging are on different filesystems, FilePup stops
-    the job instead of silently falling back to copy-and-delete behavior.
+    Single-file intake uses an atomic rename. Directory intake first inventories
+    the torrent, preflights the complete supported-media batch, then moves one
+    child at a time while recording child state after each verified move.
 
-    Multi-file torrent directories are also refused for now. FilePup must gain
-    per-file inventory/state tracking before it is allowed to move files out of
-    a directory piecemeal.
+    Cross-filesystem copy-and-delete remains intentionally disabled.
     """
 
     def __init__(self, config: FilePupConfig, store: JobStore):
@@ -52,12 +51,6 @@ class IntakeEngine:
         if not source.exists():
             return self._attention(job, f"Source does not exist: {source}")
 
-        if source.is_dir():
-            return self._attention(
-                job,
-                "Directory torrent intake is not implemented yet; source preserved",
-            )
-
         # Never create a media mount path automatically. A missing Staging path
         # could mean the expected disk/share is not mounted.
         if not staging_root.is_dir():
@@ -66,6 +59,12 @@ class IntakeEngine:
                 f"Staging directory is unavailable: {staging_root}",
             )
 
+        if source.is_dir():
+            return self._stage_directory(job, source, staging_root)
+
+        return self._stage_single(job, source, staging_root)
+
+    def _stage_single(self, job: Job, source: Path, staging_root: Path) -> IntakeResult:
         destination = staging_root / source.name
         if destination.exists():
             return self._attention(
@@ -97,6 +96,115 @@ class IntakeEngine:
             status_message="Moved to Staging and verified",
         )
         return IntakeResult(updated, True, f"Staged at {destination}")
+
+    def _stage_directory(
+        self,
+        job: Job,
+        source_root: Path,
+        staging_root: Path,
+    ) -> IntakeResult:
+        inventory = InventoryEngine(self.store).inventory(job.id)
+        supported = [
+            file for file in inventory.files if file.state is JobFileState.DISCOVERED
+        ]
+
+        if not supported:
+            return self._attention(
+                job,
+                "Directory contains no supported media files; source preserved",
+            )
+
+        planned: list[tuple[object, Path, Path]] = []
+        for file in supported:
+            file_source = file.source_path.expanduser().resolve()
+            if not self._is_within(file_source, source_root):
+                return self._attention(
+                    job,
+                    f"Inventoried file escapes source directory; refusing batch: {file_source}",
+                )
+            if not file_source.is_file() or file_source.is_symlink():
+                return self._attention(
+                    job,
+                    f"Inventoried source is unavailable or unsafe: {file_source}",
+                )
+
+            destination = (staging_root / file.relative_path).resolve()
+            if not self._is_within(destination, staging_root):
+                return self._attention(
+                    job,
+                    f"Planned destination escapes Staging; refusing batch: {destination}",
+                )
+            if destination.exists():
+                return self._attention(
+                    job,
+                    f"Destination already exists; refusing entire batch: {destination}",
+                )
+            if file_source.stat().st_dev != staging_root.stat().st_dev:
+                return self._attention(
+                    job,
+                    "Completed Torrents and Staging are on different filesystems; "
+                    "cross-filesystem copy-and-delete is intentionally disabled",
+                )
+            planned.append((file, file_source, destination))
+
+        # Creating empty destination directories is harmless and ensures a
+        # mkdir failure happens before any source media is moved.
+        try:
+            for _, _, destination in planned:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return self._attention(job, f"Could not prepare Staging directories: {exc}")
+
+        moved_count = 0
+        for file, file_source, destination in planned:
+            try:
+                os.rename(file_source, destination)
+            except OSError as exc:
+                message = (
+                    f"Batch stopped after {moved_count} verified move(s); "
+                    f"failed moving {file.relative_path}: {exc}"
+                )
+                self.store.update_job_file(
+                    file.id,
+                    state=JobFileState.NEEDS_ATTENTION,
+                    status_message=message,
+                )
+                return self._attention(job, message)
+
+            if not destination.exists() or file_source.exists():
+                message = (
+                    f"Batch stopped after {moved_count} verified move(s); "
+                    f"post-move verification failed for {file.relative_path}"
+                )
+                self.store.update_job_file(
+                    file.id,
+                    state=JobFileState.NEEDS_ATTENTION,
+                    status_message=message,
+                )
+                return self._attention(job, message)
+
+            self.store.update_job_file(
+                file.id,
+                state=JobFileState.STAGED,
+                staged_path=destination,
+                status_message="Moved to Staging and verified",
+            )
+            moved_count += 1
+
+        updated = self.store.update_job(
+            job.id,
+            state=JobState.STAGED,
+            staged_path=staging_root,
+            status_message=(
+                f"Staged {moved_count} supported media file(s); "
+                f"preserved {inventory.ignored_count} ignored file(s) in source"
+            ),
+        )
+        return IntakeResult(
+            updated,
+            True,
+            f"Staged {moved_count} supported media file(s)",
+        )
 
     def _attention(self, job: Job, message: str) -> IntakeResult:
         updated = self.store.update_job(
