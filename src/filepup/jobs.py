@@ -16,11 +16,31 @@ class JobState(StrEnum):
     NEEDS_ATTENTION = "NEEDS_ATTENTION"
 
 
+class JobFileState(StrEnum):
+    DISCOVERED = "DISCOVERED"
+    STAGED = "STAGED"
+    IGNORED = "IGNORED"
+    NEEDS_ATTENTION = "NEEDS_ATTENTION"
+
+
 @dataclass(frozen=True)
 class Job:
     id: int
     source_path: Path
     state: JobState
+    created_at: str
+    updated_at: str
+    staged_path: Path | None = None
+    status_message: str | None = None
+
+
+@dataclass(frozen=True)
+class JobFile:
+    id: int
+    job_id: int
+    source_path: Path
+    relative_path: Path
+    state: JobFileState
     created_at: str
     updated_at: str
     staged_path: Path | None = None
