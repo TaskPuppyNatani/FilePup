@@ -32,6 +32,37 @@ def test_inventory_tracks_supported_and_ignored_files(tmp_path: Path) -> None:
     assert result.files[3].state is JobFileState.IGNORED
 
 
+def test_inventory_recognizes_audio_formats(tmp_path: Path) -> None:
+    source = tmp_path / "Album"
+    source.mkdir()
+    audio_names = [
+        "01 Track.mp3",
+        "02 Track.flac",
+        "03 Track.m4a",
+        "04 Track.aac",
+        "05 Track.ogg",
+        "06 Track.opus",
+        "07 Track.wav",
+        "08 Track.alac",
+        "09 Track.wma",
+        "10 Track.ape",
+        "11 Track.aiff",
+        "12 Track.aif",
+        "13 Audiobook.m4b",
+    ]
+    for name in audio_names:
+        (source / name).write_bytes(b"audio")
+
+    store = JobStore(tmp_path / "filepup.db")
+    job, _ = store.ingest(source)
+
+    result = InventoryEngine(store).inventory(job.id)
+
+    assert result.supported_count == len(audio_names)
+    assert result.ignored_count == 0
+    assert all(file.state is JobFileState.DISCOVERED for file in result.files)
+
+
 def test_inventory_preserves_nested_relative_paths(tmp_path: Path) -> None:
     source = tmp_path / "Bluey Season 3"
     nested = source / "Season 03"
