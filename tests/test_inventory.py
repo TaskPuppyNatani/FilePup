@@ -63,6 +63,46 @@ def test_inventory_recognizes_audio_formats(tmp_path: Path) -> None:
     assert all(file.state is JobFileState.DISCOVERED for file in result.files)
 
 
+def test_inventory_recognizes_legacy_video_formats(tmp_path: Path) -> None:
+    source = tmp_path / "Videos"
+    source.mkdir()
+    video_names = [
+        "clip.avi",
+        "clip.m4v",
+        "clip.mov",
+        "clip.wmv",
+        "clip.ts",
+        "clip.mpg",
+        "clip.mpeg",
+    ]
+    for name in video_names:
+        (source / name).write_bytes(b"video")
+
+    store = JobStore(tmp_path / "filepup.db")
+    job, _ = store.ingest(source)
+    result = InventoryEngine(store).inventory(job.id)
+
+    assert result.supported_count == len(video_names)
+    assert result.ignored_count == 0
+
+
+def test_inventory_ignores_symlinked_files(tmp_path: Path) -> None:
+    source = tmp_path / "Torrent"
+    source.mkdir()
+    outside = tmp_path / "outside.mkv"
+    outside.write_bytes(b"outside")
+    (source / "escape.mkv").symlink_to(outside)
+
+    store = JobStore(tmp_path / "filepup.db")
+    job, _ = store.ingest(source)
+    result = InventoryEngine(store).inventory(job.id)
+
+    assert result.supported_count == 0
+    assert result.ignored_count == 0
+    assert result.files == []
+    assert outside.read_bytes() == b"outside"
+
+
 def test_inventory_preserves_nested_relative_paths(tmp_path: Path) -> None:
     source = tmp_path / "Bluey Season 3"
     nested = source / "Season 03"
