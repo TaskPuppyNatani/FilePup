@@ -121,26 +121,75 @@ class JobStore:
         job_id: int,
         files: list[tuple[Path, Path, JobFileState, str | None]],
     ) -> list[JobFile]:
+        """Reconcile a fresh source scan without erasing processed child history.
+
+        DISCOVERED and IGNORED rows are scan state and may be refreshed or
+        removed when they disappear from the source tree. STAGED and
+        NEEDS_ATTENTION rows are processing history and are preserved across
+        later inventory scans.
+        """
         if self.get_job(job_id) is None:
             raise ValueError(f"Unknown job id: {job_id}")
 
         with self._connect() as conn:
-            conn.execute("DELETE FROM job_files WHERE job_id = ?", (job_id,))
+            existing_rows = conn.execute(
+                "SELECT * FROM job_files WHERE job_id = ?",
+                (job_id,),
+            ).fetchall()
+            existing_by_source = {row["source_path"]: row for row in existing_rows}
+            seen_sources: set[str] = set()
+
             for source_path, relative_path, state, status_message in files:
+                source_text = str(source_path)
+                seen_sources.add(source_text)
+                current = existing_by_source.get(source_text)
+
+                if current is None:
+                    conn.execute(
+                        """
+                        INSERT INTO job_files
+                            (job_id, source_path, relative_path, state, status_message)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            job_id,
+                            source_text,
+                            str(relative_path),
+                            state.value,
+                            status_message,
+                        ),
+                    )
+                    continue
+
+                current_state = JobFileState(current["state"])
+                if current_state in {JobFileState.STAGED, JobFileState.NEEDS_ATTENTION}:
+                    continue
+
                 conn.execute(
                     """
-                    INSERT INTO job_files
-                        (job_id, source_path, relative_path, state, status_message)
-                    VALUES (?, ?, ?, ?, ?)
+                    UPDATE job_files
+                       SET relative_path = ?, state = ?, status_message = ?,
+                           staged_path = NULL, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?
                     """,
                     (
-                        job_id,
-                        str(source_path),
                         str(relative_path),
                         state.value,
                         status_message,
+                        current["id"],
                     ),
                 )
+
+            for row in existing_rows:
+                if row["source_path"] in seen_sources:
+                    continue
+                if JobFileState(row["state"]) in {
+                    JobFileState.STAGED,
+                    JobFileState.NEEDS_ATTENTION,
+                }:
+                    continue
+                conn.execute("DELETE FROM job_files WHERE id = ?", (row["id"],))
+
             rows = conn.execute(
                 "SELECT * FROM job_files WHERE job_id = ? ORDER BY relative_path",
                 (job_id,),
