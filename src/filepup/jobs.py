@@ -23,3 +23,5 @@ class Job:
     state: JobState
     created_at: str
     updated_at: str
+    staged_path: Path | None = None
+    status_message: str | None = None
