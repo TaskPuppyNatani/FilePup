@@ -1,7 +1,7 @@
 import sqlite3
 from pathlib import Path
 
-from .jobs import Job, JobState
+from .jobs import Job, JobFile, JobFileState, JobState
 
 
 SCHEMA = """
@@ -13,6 +13,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     status_message TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS job_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    source_path TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    state TEXT NOT NULL,
+    staged_path TEXT,
+    status_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(job_id, source_path),
+    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
 );
 """
 
@@ -26,6 +40,7 @@ class JobStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.database_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init_db(self) -> None:
@@ -101,6 +116,41 @@ class JobStore:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._row_to_job(row)
 
+    def replace_job_files(self, job_id: int, files: list[tuple[Path, Path, JobFileState, str | None]]) -> list[JobFile]:
+        if self.get_job(job_id) is None:
+            raise ValueError(f"Unknown job id: {job_id}")
+
+        with self._connect() as conn:
+            conn.execute("DELETE FROM job_files WHERE job_id = ?", (job_id,))
+            for source_path, relative_path, state, status_message in files:
+                conn.execute(
+                    """
+                    INSERT INTO job_files
+                        (job_id, source_path, relative_path, state, status_message)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        str(source_path),
+                        str(relative_path),
+                        state.value,
+                        status_message,
+                    ),
+                )
+            rows = conn.execute(
+                "SELECT * FROM job_files WHERE job_id = ? ORDER BY relative_path",
+                (job_id,),
+            ).fetchall()
+        return [self._row_to_job_file(row) for row in rows]
+
+    def list_job_files(self, job_id: int) -> list[JobFile]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM job_files WHERE job_id = ? ORDER BY relative_path",
+                (job_id,),
+            ).fetchall()
+        return [self._row_to_job_file(row) for row in rows]
+
     def list_jobs(self) -> list[Job]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC").fetchall()
@@ -116,6 +166,20 @@ class JobStore:
             state=JobState(row["state"]),
             staged_path=None if staged_path is None else Path(staged_path),
             status_message=status_message,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_job_file(row: sqlite3.Row) -> JobFile:
+        return JobFile(
+            id=row["id"],
+            job_id=row["job_id"],
+            source_path=Path(row["source_path"]),
+            relative_path=Path(row["relative_path"]),
+            state=JobFileState(row["state"]),
+            staged_path=None if row["staged_path"] is None else Path(row["staged_path"]),
+            status_message=row["status_message"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
