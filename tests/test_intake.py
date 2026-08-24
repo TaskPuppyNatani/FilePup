@@ -84,3 +84,22 @@ def test_stage_refuses_missing_staging_directory(tmp_path: Path) -> None:
     assert result.moved is False
     assert result.job.state is JobState.NEEDS_ATTENTION
     assert source.exists()
+
+
+def test_stage_refuses_directory_torrent_until_per_file_tracking_exists(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    store = JobStore(config.database_path)
+    source = config.completed_torrents / "Bluey.Season.03"
+    source.mkdir()
+    episode = source / "Bluey.S03E12.mkv"
+    episode.write_bytes(b"test-media")
+    job, _ = store.ingest(source)
+
+    result = IntakeEngine(config, store).stage(job.id)
+
+    assert result.moved is False
+    assert result.job.state is JobState.NEEDS_ATTENTION
+    assert "Directory torrent intake is not implemented yet" in result.message
+    assert source.is_dir()
+    assert episode.read_bytes() == b"test-media"
+    assert not (config.staging / source.name).exists()
