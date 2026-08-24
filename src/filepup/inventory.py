@@ -5,9 +5,12 @@ from .database import JobStore
 from .jobs import JobFile, JobFileState
 
 
-SUPPORTED_MEDIA_EXTENSIONS = {
+VIDEO_EXTENSIONS = {
     ".mkv",
     ".mp4",
+}
+
+EBOOK_EXTENSIONS = {
     ".epub",
     ".pdf",
     ".mobi",
@@ -15,6 +18,24 @@ SUPPORTED_MEDIA_EXTENSIONS = {
     ".cbz",
     ".cbr",
 }
+
+AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".flac",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".alac",
+    ".wma",
+    ".ape",
+    ".aiff",
+    ".aif",
+    ".m4b",
+}
+
+SUPPORTED_MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | EBOOK_EXTENSIONS | AUDIO_EXTENSIONS
 
 
 @dataclass(frozen=True)
