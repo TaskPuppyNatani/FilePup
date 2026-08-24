@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_path TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL,
+    staged_path TEXT,
+    status_message TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -29,6 +31,18 @@ class JobStore:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate_jobs_table(conn)
+
+    @staticmethod
+    def _migrate_jobs_table(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "staged_path" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN staged_path TEXT")
+        if "status_message" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN status_message TEXT")
 
     def ingest(self, source_path: Path) -> tuple[Job, bool]:
         source = str(Path(source_path).expanduser().resolve())
@@ -48,6 +62,45 @@ class JobStore:
             ).fetchone()
             return self._row_to_job(row), True
 
+    def get_job(self, job_id: int) -> Job | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return None if row is None else self._row_to_job(row)
+
+    def update_job(
+        self,
+        job_id: int,
+        *,
+        state: JobState | None = None,
+        staged_path: Path | None = None,
+        status_message: str | None = None,
+    ) -> Job:
+        current = self.get_job(job_id)
+        if current is None:
+            raise ValueError(f"Unknown job id: {job_id}")
+
+        next_state = state or current.state
+        next_staged_path = staged_path if staged_path is not None else current.staged_path
+        next_message = status_message if status_message is not None else current.status_message
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                   SET state = ?, staged_path = ?, status_message = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?
+                """,
+                (
+                    next_state.value,
+                    None if next_staged_path is None else str(next_staged_path),
+                    next_message,
+                    job_id,
+                ),
+            )
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return self._row_to_job(row)
+
     def list_jobs(self) -> list[Job]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC").fetchall()
@@ -55,10 +108,14 @@ class JobStore:
 
     @staticmethod
     def _row_to_job(row: sqlite3.Row) -> Job:
+        staged_path = row["staged_path"] if "staged_path" in row.keys() else None
+        status_message = row["status_message"] if "status_message" in row.keys() else None
         return Job(
             id=row["id"],
             source_path=Path(row["source_path"]),
             state=JobState(row["state"]),
+            staged_path=None if staged_path is None else Path(staged_path),
+            status_message=status_message,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
