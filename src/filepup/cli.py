@@ -3,6 +3,7 @@ from pathlib import Path
 
 from .config import FilePupConfig
 from .database import JobStore
+from .intake import IntakeEngine
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -11,6 +12,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser("ingest", help="Register a completed torrent path")
     ingest.add_argument("path", type=Path)
+
+    stage = sub.add_parser("stage", help="Move a discovered job safely into Staging")
+    stage.add_argument("job_id", type=int)
 
     sub.add_parser("jobs", help="List known jobs")
     return parser
@@ -27,6 +31,12 @@ def main() -> None:
         print(f"Job {job.id} {verb}: {job.state.value} {job.source_path}")
         return
 
+    if args.command == "stage":
+        result = IntakeEngine(config, store).stage(args.job_id)
+        print(f"Job {result.job.id}: {result.job.state.value} - {result.message}")
+        return
+
     if args.command == "jobs":
         for job in store.list_jobs():
-            print(f"{job.id}\t{job.state.value}\t{job.source_path}")
+            details = f"\t{job.status_message}" if job.status_message else ""
+            print(f"{job.id}\t{job.state.value}\t{job.source_path}{details}")
