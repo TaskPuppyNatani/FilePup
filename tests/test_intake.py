@@ -3,7 +3,7 @@ from pathlib import Path
 from filepup.config import FilePupConfig
 from filepup.database import JobStore
 from filepup.intake import IntakeEngine
-from filepup.jobs import JobState
+from filepup.jobs import JobFileState, JobState
 
 
 def make_config(tmp_path: Path) -> FilePupConfig:
@@ -86,20 +86,53 @@ def test_stage_refuses_missing_staging_directory(tmp_path: Path) -> None:
     assert source.exists()
 
 
-def test_stage_refuses_directory_torrent_until_per_file_tracking_exists(tmp_path: Path) -> None:
+def test_stage_directory_moves_supported_and_preserves_ignored(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    store = JobStore(config.database_path)
+    source = config.completed_torrents / "Bluey.Season.03"
+    nested = source / "Season 03"
+    nested.mkdir(parents=True)
+    episode = nested / "Bluey.S03E12.mkv"
+    music = source / "Bluey.Theme.flac"
+    poster = source / "poster.jpg"
+    episode.write_bytes(b"episode")
+    music.write_bytes(b"theme")
+    poster.write_bytes(b"poster")
+    job, _ = store.ingest(source)
+
+    result = IntakeEngine(config, store).stage(job.id)
+
+    assert result.moved is True
+    assert result.job.state is JobState.STAGED
+    assert (config.staging / "Season 03" / episode.name).read_bytes() == b"episode"
+    assert (config.staging / music.name).read_bytes() == b"theme"
+    assert poster.read_bytes() == b"poster"
+    assert not episode.exists()
+    assert not music.exists()
+    files = store.list_job_files(job.id)
+    staged = [file for file in files if file.state is JobFileState.STAGED]
+    ignored = [file for file in files if file.state is JobFileState.IGNORED]
+    assert len(staged) == 2
+    assert len(ignored) == 1
+
+
+def test_stage_directory_conflict_stops_entire_batch_before_moves(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     store = JobStore(config.database_path)
     source = config.completed_torrents / "Bluey.Season.03"
     source.mkdir()
-    episode = source / "Bluey.S03E12.mkv"
-    episode.write_bytes(b"test-media")
+    first = source / "Bluey.S03E12.mkv"
+    second = source / "Bluey.S03E13.mkv"
+    first.write_bytes(b"episode-12")
+    second.write_bytes(b"episode-13")
+    (config.staging / second.name).write_bytes(b"existing")
     job, _ = store.ingest(source)
 
     result = IntakeEngine(config, store).stage(job.id)
 
     assert result.moved is False
     assert result.job.state is JobState.NEEDS_ATTENTION
-    assert "Directory torrent intake is not implemented yet" in result.message
-    assert source.is_dir()
-    assert episode.read_bytes() == b"test-media"
-    assert not (config.staging / source.name).exists()
+    assert first.read_bytes() == b"episode-12"
+    assert second.read_bytes() == b"episode-13"
+    assert not (config.staging / first.name).exists()
+    assert (config.staging / second.name).read_bytes() == b"existing"
