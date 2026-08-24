@@ -116,7 +116,11 @@ class JobStore:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._row_to_job(row)
 
-    def replace_job_files(self, job_id: int, files: list[tuple[Path, Path, JobFileState, str | None]]) -> list[JobFile]:
+    def replace_job_files(
+        self,
+        job_id: int,
+        files: list[tuple[Path, Path, JobFileState, str | None]],
+    ) -> list[JobFile]:
         if self.get_job(job_id) is None:
             raise ValueError(f"Unknown job id: {job_id}")
 
@@ -142,6 +146,56 @@ class JobStore:
                 (job_id,),
             ).fetchall()
         return [self._row_to_job_file(row) for row in rows]
+
+    def update_job_file(
+        self,
+        file_id: int,
+        *,
+        state: JobFileState | None = None,
+        staged_path: Path | None = None,
+        status_message: str | None = None,
+    ) -> JobFile:
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM job_files WHERE id = ?", (file_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"Unknown job file id: {file_id}")
+
+            next_state = state or JobFileState(current["state"])
+            next_staged_path = (
+                staged_path
+                if staged_path is not None
+                else (
+                    None
+                    if current["staged_path"] is None
+                    else Path(current["staged_path"])
+                )
+            )
+            next_message = (
+                status_message
+                if status_message is not None
+                else current["status_message"]
+            )
+
+            conn.execute(
+                """
+                UPDATE job_files
+                   SET state = ?, staged_path = ?, status_message = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?
+                """,
+                (
+                    next_state.value,
+                    None if next_staged_path is None else str(next_staged_path),
+                    next_message,
+                    file_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM job_files WHERE id = ?", (file_id,)
+            ).fetchone()
+        return self._row_to_job_file(row)
 
     def list_job_files(self, job_id: int) -> list[JobFile]:
         with self._connect() as conn:
