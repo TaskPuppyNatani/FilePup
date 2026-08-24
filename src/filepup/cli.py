@@ -4,6 +4,7 @@ from pathlib import Path
 from .config import FilePupConfig
 from .database import JobStore
 from .intake import IntakeEngine
+from .inventory import InventoryEngine
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -12,6 +13,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser("ingest", help="Register a completed torrent path")
     ingest.add_argument("path", type=Path)
+
+    inventory = sub.add_parser("inventory", help="Inventory files belonging to a job")
+    inventory.add_argument("job_id", type=int)
 
     stage = sub.add_parser("stage", help="Move a discovered job safely into Staging")
     stage.add_argument("job_id", type=int)
@@ -29,6 +33,16 @@ def main() -> None:
         job, created = store.ingest(args.path)
         verb = "created" if created else "already known"
         print(f"Job {job.id} {verb}: {job.state.value} {job.source_path}")
+        return
+
+    if args.command == "inventory":
+        result = InventoryEngine(store).inventory(args.job_id)
+        print(
+            f"Job {args.job_id}: {result.supported_count} supported, "
+            f"{result.ignored_count} ignored"
+        )
+        for file in result.files:
+            print(f"{file.state.value}\t{file.relative_path}\t{file.status_message}")
         return
 
     if args.command == "stage":
