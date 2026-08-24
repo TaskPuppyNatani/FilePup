@@ -5,8 +5,9 @@ from pathlib import Path
 
 from .config import FilePupConfig
 from .database import JobStore
-from .inventory import InventoryEngine
+from .inventory import InventoryEngine, SUPPORTED_MEDIA_EXTENSIONS
 from .jobs import Job, JobFileState, JobState
+from .safety import SafetyController
 
 
 @dataclass(frozen=True)
@@ -17,18 +18,22 @@ class IntakeResult:
 
 
 class IntakeEngine:
-    """Move completed torrent content into Staging without overwriting anything.
+    """Move completed torrent content into Staging without unsafe cleanup.
 
-    Single-file intake uses an atomic rename. Directory intake first inventories
-    the torrent, preflights the complete supported-media batch, then moves one
-    child at a time while recording child state after each verified move.
+    Single-file intake uses an atomic rename. Directory intake inventories the
+    torrent and then processes supported child files independently, preserving
+    relative paths and recording the outcome of every child.
 
-    Cross-filesystem copy-and-delete remains intentionally disabled.
+    Destination conflicts never overwrite existing files. Verified duplicates
+    are recognized, but source deletion remains controlled exclusively by
+    SafetyController and is currently hard-disabled. Cross-filesystem
+    copy-and-delete is also intentionally disabled.
     """
 
     def __init__(self, config: FilePupConfig, store: JobStore):
         self.config = config
         self.store = store
+        self.safety = SafetyController()
 
     def stage(self, job_id: int) -> IntakeResult:
         job = self.store.get_job(job_id)
@@ -65,11 +70,26 @@ class IntakeEngine:
         return self._stage_single(job, source, staging_root)
 
     def _stage_single(self, job: Job, source: Path, staging_root: Path) -> IntakeResult:
+        if source.suffix.lower() not in SUPPORTED_MEDIA_EXTENSIONS:
+            updated = self.store.update_job(
+                job.id,
+                state=JobState.COMPLETE,
+                status_message="Unsupported extension; source preserved",
+            )
+            return IntakeResult(updated, False, "Unsupported extension; source preserved")
+
         destination = staging_root / source.name
         if destination.exists():
+            if self._files_identical(source, destination):
+                decision = self.safety.may_delete_source(source)
+                return self._attention(
+                    job,
+                    "Duplicate destination verified but source deletion was refused: "
+                    f"{decision.reason}",
+                )
             return self._attention(
                 job,
-                f"Destination already exists; refusing overwrite: {destination}",
+                f"Destination already exists but is not identical; source preserved: {destination}",
             )
 
         try:
@@ -109,79 +129,97 @@ class IntakeEngine:
         ]
 
         if not supported:
-            return self._attention(
-                job,
+            updated = self.store.update_job(
+                job.id,
+                state=JobState.COMPLETE,
+                status_message="Directory contains no supported media files; source preserved",
+            )
+            return IntakeResult(
+                updated,
+                False,
                 "Directory contains no supported media files; source preserved",
             )
 
-        planned: list[tuple[object, Path, Path]] = []
+        moved_count = 0
+        failed_count = 0
+        duplicate_count = 0
+
         for file in supported:
             file_source = file.source_path.expanduser().resolve()
             if not self._is_within(file_source, source_root):
-                return self._attention(
-                    job,
-                    f"Inventoried file escapes source directory; refusing batch: {file_source}",
+                self._file_attention(
+                    file.id,
+                    f"Inventoried file escapes source directory: {file_source}",
                 )
+                failed_count += 1
+                continue
+
             if not file_source.is_file() or file_source.is_symlink():
-                return self._attention(
-                    job,
+                self._file_attention(
+                    file.id,
                     f"Inventoried source is unavailable or unsafe: {file_source}",
                 )
+                failed_count += 1
+                continue
 
             destination = (staging_root / file.relative_path).resolve()
             if not self._is_within(destination, staging_root):
-                return self._attention(
-                    job,
-                    f"Planned destination escapes Staging; refusing batch: {destination}",
+                self._file_attention(
+                    file.id,
+                    f"Planned destination escapes Staging: {destination}",
                 )
+                failed_count += 1
+                continue
+
             if destination.exists():
-                return self._attention(
-                    job,
-                    f"Destination already exists; refusing entire batch: {destination}",
-                )
-            if file_source.stat().st_dev != staging_root.stat().st_dev:
-                return self._attention(
-                    job,
-                    "Completed Torrents and Staging are on different filesystems; "
-                    "cross-filesystem copy-and-delete is intentionally disabled",
-                )
-            planned.append((file, file_source, destination))
+                if self._files_identical(file_source, destination):
+                    decision = self.safety.may_delete_source(file_source)
+                    self._file_attention(
+                        file.id,
+                        "Duplicate destination verified but source deletion was refused: "
+                        f"{decision.reason}",
+                    )
+                    duplicate_count += 1
+                else:
+                    self._file_attention(
+                        file.id,
+                        "Destination already exists but is not identical; source preserved: "
+                        f"{destination}",
+                    )
+                failed_count += 1
+                continue
 
-        # Creating empty destination directories is harmless and ensures a
-        # mkdir failure happens before any source media is moved.
-        try:
-            for _, _, destination in planned:
+            try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return self._attention(job, f"Could not prepare Staging directories: {exc}")
+            except OSError as exc:
+                self._file_attention(
+                    file.id,
+                    f"Could not prepare destination directory: {exc}",
+                )
+                failed_count += 1
+                continue
 
-        moved_count = 0
-        for file, file_source, destination in planned:
             try:
                 os.rename(file_source, destination)
             except OSError as exc:
-                message = (
-                    f"Batch stopped after {moved_count} verified move(s); "
-                    f"failed moving {file.relative_path}: {exc}"
-                )
-                self.store.update_job_file(
-                    file.id,
-                    state=JobFileState.NEEDS_ATTENTION,
-                    status_message=message,
-                )
-                return self._attention(job, message)
+                if exc.errno == errno.EXDEV:
+                    message = (
+                        "Source and Staging are on different filesystems; "
+                        "cross-filesystem copy-and-delete is intentionally disabled"
+                    )
+                else:
+                    message = f"Staging move failed: {exc}"
+                self._file_attention(file.id, message)
+                failed_count += 1
+                continue
 
             if not destination.exists() or file_source.exists():
-                message = (
-                    f"Batch stopped after {moved_count} verified move(s); "
-                    f"post-move verification failed for {file.relative_path}"
-                )
-                self.store.update_job_file(
+                self._file_attention(
                     file.id,
-                    state=JobFileState.NEEDS_ATTENTION,
-                    status_message=message,
+                    f"Post-move verification failed for {file.relative_path}",
                 )
-                return self._attention(job, message)
+                failed_count += 1
+                continue
 
             self.store.update_job_file(
                 file.id,
@@ -190,6 +228,22 @@ class IntakeEngine:
                 status_message="Moved to Staging and verified",
             )
             moved_count += 1
+
+        if failed_count:
+            message = (
+                f"Staged {moved_count} supported media file(s); "
+                f"{failed_count} file(s) need attention; "
+                f"preserved {inventory.ignored_count} ignored file(s)"
+            )
+            if duplicate_count:
+                message += f"; {duplicate_count} verified duplicate(s) preserved"
+            updated = self.store.update_job(
+                job.id,
+                state=JobState.NEEDS_ATTENTION,
+                staged_path=staging_root if moved_count else None,
+                status_message=message,
+            )
+            return IntakeResult(updated, moved_count > 0, message)
 
         updated = self.store.update_job(
             job.id,
@@ -206,6 +260,13 @@ class IntakeEngine:
             f"Staged {moved_count} supported media file(s)",
         )
 
+    def _file_attention(self, file_id: int, message: str) -> None:
+        self.store.update_job_file(
+            file_id,
+            state=JobFileState.NEEDS_ATTENTION,
+            status_message=message,
+        )
+
     def _attention(self, job: Job, message: str) -> IntakeResult:
         updated = self.store.update_job(
             job.id,
@@ -213,6 +274,23 @@ class IntakeEngine:
             status_message=message,
         )
         return IntakeResult(updated, False, message)
+
+    @staticmethod
+    def _files_identical(source: Path, destination: Path) -> bool:
+        if not source.is_file() or not destination.is_file():
+            return False
+        if source.stat().st_size != destination.stat().st_size:
+            return False
+
+        chunk_size = 1024 * 1024
+        with source.open("rb") as src, destination.open("rb") as dst:
+            while True:
+                src_chunk = src.read(chunk_size)
+                dst_chunk = dst.read(chunk_size)
+                if src_chunk != dst_chunk:
+                    return False
+                if not src_chunk:
+                    return True
 
     @staticmethod
     def _is_within(path: Path, root: Path) -> bool:
