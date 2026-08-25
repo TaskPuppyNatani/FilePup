@@ -84,6 +84,191 @@ def prepare_operation(
     return operation
 
 
+def mark_operation_renamed(store: JobStore, operation_id: int, job_id: int) -> None:
+    claim = store.claim_job(job_id, "rename-recording-worker")
+    assert claim is not None
+    store.mark_move_renamed(operation_id, claim)
+    store.release_job_claim(claim)
+
+
+def test_prepared_recovery_defers_when_staging_root_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    config, store, job, source, record = prepare_directory_job(tmp_path)
+    operation = prepare_operation(
+        store,
+        job.id,
+        source,
+        config.staging / source.name,
+        file_id=record.id,
+        prior_state=record.state,
+    )
+    before_job = store.get_job(job.id)
+    before_file = store.list_job_files(job.id)[0]
+    config.staging.rmdir()
+
+    result = IntakeEngine(config, store).recover(job.id)
+
+    assert result.moved is False
+    assert "Recovery deferred" in result.message
+    assert "Staging" in result.message
+    assert result.job == before_job
+    assert not config.staging.exists()
+    assert source.exists()
+    assert not (config.staging / source.name).exists()
+    assert store.get_move_operation(operation.id).phase is MoveOperationPhase.PREPARED
+    assert store.list_job_files(job.id)[0] == before_file
+
+
+def test_prepared_recovery_defers_when_completed_root_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    config, store, job, source, record = prepare_directory_job(tmp_path)
+    operation = prepare_operation(
+        store,
+        job.id,
+        source,
+        config.staging / source.name,
+        file_id=record.id,
+        prior_state=record.state,
+    )
+    hidden_completed = tmp_path / "Completed_Torrents.hidden"
+    config.completed_torrents.rename(hidden_completed)
+    hidden_source = hidden_completed / source.relative_to(config.completed_torrents)
+
+    try:
+        result = IntakeEngine(config, store).recover(job.id)
+
+        assert result.moved is False
+        assert "Recovery deferred" in result.message
+        assert "Completed Torrents" in result.message
+        assert not config.completed_torrents.exists()
+        assert hidden_source.exists()
+        assert store.get_move_operation(operation.id).phase is MoveOperationPhase.PREPARED
+        assert store.list_job_files(job.id)[0].state is JobFileState.MOVING
+    finally:
+        hidden_completed.rename(config.completed_torrents)
+
+
+def test_renamed_recovery_defers_without_staging_then_reconciles_after_restore(
+    tmp_path: Path,
+) -> None:
+    config, store, job, source, record = prepare_directory_job(tmp_path)
+    destination = config.staging / source.name
+    operation = prepare_operation(
+        store,
+        job.id,
+        source,
+        destination,
+        file_id=record.id,
+        prior_state=record.state,
+    )
+    IntakeEngine._move_without_replacing(source, destination)
+    mark_operation_renamed(store, operation.id, job.id)
+    hidden_staging = tmp_path / "Staging.hidden"
+    config.staging.rename(hidden_staging)
+
+    try:
+        deferred = IntakeEngine(config, store).recover(job.id)
+
+        assert deferred.moved is False
+        assert "Recovery deferred" in deferred.message
+        assert not config.staging.exists()
+        assert not source.exists()
+        assert (hidden_staging / destination.relative_to(config.staging)).exists()
+        assert store.get_move_operation(operation.id).phase is MoveOperationPhase.RENAMED
+        assert store.list_job_files(job.id)[0].state is JobFileState.MOVING
+    finally:
+        hidden_staging.rename(config.staging)
+
+    recovered = IntakeEngine(config, store).recover(job.id)
+
+    assert recovered.moved is True
+    assert recovered.job.state is JobState.STAGED
+    assert destination.read_bytes() == b"episode-12"
+    assert store.get_move_operation(operation.id).phase is MoveOperationPhase.COMPLETED
+    assert store.list_job_files(job.id)[0].state is JobFileState.STAGED
+
+
+def test_repeated_deferred_recovery_is_idempotent_and_creates_no_media_root(
+    tmp_path: Path,
+) -> None:
+    config, store, job, source, record = prepare_directory_job(tmp_path)
+    operation = prepare_operation(
+        store,
+        job.id,
+        source,
+        config.staging / source.name,
+        file_id=record.id,
+        prior_state=record.state,
+    )
+    config.staging.rmdir()
+    before = (
+        store.get_job(job.id),
+        store.list_job_files(job.id)[0],
+        store.get_move_operation(operation.id),
+    )
+
+    first = IntakeEngine(config, store).recover(job.id)
+    second = IntakeEngine(config, store).recover(job.id)
+    after = (
+        store.get_job(job.id),
+        store.list_job_files(job.id)[0],
+        store.get_move_operation(operation.id),
+    )
+
+    assert first.moved is False
+    assert second.moved is False
+    assert "Recovery deferred" in first.message
+    assert "Recovery deferred" in second.message
+    assert before == after
+    assert not config.staging.exists()
+    assert source.exists()
+
+
+@pytest.mark.parametrize("missing_root", ["completed", "staging"])
+def test_retry_with_pending_move_also_defers_when_media_root_is_unavailable(
+    tmp_path: Path,
+    missing_root: str,
+) -> None:
+    config, store, job, source, record = prepare_directory_job(tmp_path)
+    operation = prepare_operation(
+        store,
+        job.id,
+        source,
+        config.staging / source.name,
+        file_id=record.id,
+        prior_state=record.state,
+    )
+    store.update_job(job.id, state=JobState.NEEDS_ATTENTION)
+    hidden_root = tmp_path / f"{missing_root}.hidden"
+    if missing_root == "completed":
+        config.completed_torrents.rename(hidden_root)
+    else:
+        config.staging.rmdir()
+    before = (
+        store.get_job(job.id),
+        store.list_job_files(job.id)[0],
+        store.get_move_operation(operation.id),
+    )
+
+    try:
+        result = IntakeEngine(config, store).retry(job.id)
+
+        assert result.moved is False
+        assert "Recovery deferred" in result.message
+        assert (
+            store.get_job(job.id),
+            store.list_job_files(job.id)[0],
+            store.get_move_operation(operation.id),
+        ) == before
+    finally:
+        if missing_root == "completed":
+            hidden_root.rename(config.completed_torrents)
+        else:
+            config.staging.mkdir()
+
+
 def test_recovery_before_rename_records_not_moved_without_false_staged(
     tmp_path: Path,
 ) -> None:

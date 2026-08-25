@@ -89,6 +89,10 @@ filepupctl recover <job_id>
 Recovery marks a move `STAGED` only when the source is absent and the existing
 destination matches the recorded fingerprint. A source-only state is recorded
 as not moved; both paths or neither path are kept and marked for attention.
+Before those probes, recovery requires both configured `Completed_Torrents` and
+`Staging` roots to be available directories. If either root is unavailable,
+recovery is deferred with the journal and child state unchanged; FilePup never
+creates a missing media root.
 Recovery never overwrites or deletes either copy, and completed journal rows
 remain as audit history. Staging, retry, and inventory operations use a
 per-job lock plus a leased/fenced SQLite claim so different jobs can proceed

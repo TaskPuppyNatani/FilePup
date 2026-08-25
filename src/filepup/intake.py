@@ -2,6 +2,7 @@ import ctypes
 import errno
 import hashlib
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -26,6 +27,10 @@ class IntakeResult:
     job: Job
     moved: bool
     message: str
+
+
+class RecoveryDeferred(RuntimeError):
+    """Raised when journal evidence cannot be read safely from a mount."""
 
 
 class IntakeEngine:
@@ -59,6 +64,9 @@ class IntakeEngine:
         job = self.store.get_job(job_id)
         if job is None:
             raise ValueError(f"Unknown job id: {job_id}")
+        _, _, unavailable_roots = self._media_roots()
+        if unavailable_roots:
+            return self._recovery_deferred(job_id, unavailable_roots)
 
         try:
             with self.store.job_lock(job_id):
@@ -79,6 +87,12 @@ class IntakeEngine:
                 False,
                 "Job is already being processed; no filesystem changes made",
             )
+        except RecoveryDeferred as exc:
+            return IntakeResult(
+                self.store.get_job(job_id) or job,
+                False,
+                str(exc),
+            )
         except JobClaimError as exc:
             return IntakeResult(
                 self.store.get_job(job_id) or job,
@@ -96,6 +110,9 @@ class IntakeEngine:
         job = self.store.get_job(job_id)
         if job is None:
             raise ValueError(f"Unknown job id: {job_id}")
+        _, _, unavailable_roots = self._media_roots()
+        if unavailable_roots and self.store.list_pending_move_operations(job_id):
+            return self._recovery_deferred(job_id, unavailable_roots)
 
         try:
             with self.store.job_lock(job_id):
@@ -121,6 +138,12 @@ class IntakeEngine:
                 False,
                 "Job is already being processed; no filesystem changes made",
             )
+        except RecoveryDeferred as exc:
+            return IntakeResult(
+                self.store.get_job(job_id) or job,
+                False,
+                str(exc),
+            )
         except JobClaimError as exc:
             return IntakeResult(
                 self.store.get_job(job_id) or job,
@@ -137,18 +160,28 @@ class IntakeEngine:
         claim: JobClaim,
     ) -> IntakeResult:
         job = self._required_job(job_id)
-        staging_root = self.config.staging.expanduser().resolve()
+        completed_root, staging_root, unavailable_roots = self._media_roots()
 
         # Recovery is deliberately before the state gate. A crash can leave a
         # DISCOVERED parent with a destination that already contains the file.
-        claim = self._renew(claim)
-        self._reconcile_pending_moves(job_id, staging_root, claim)
-        claim = self._settle_directory_parent(
-            job_id,
-            staging_root,
-            claim,
-            allow_staged=True,
-        )
+        pending_operations = self.store.list_pending_move_operations(job_id)
+        if pending_operations and unavailable_roots:
+            return self._recovery_deferred(job_id, unavailable_roots)
+        if pending_operations:
+            claim = self._renew(claim)
+            self._reconcile_pending_moves(
+                job_id,
+                completed_root,
+                staging_root,
+                claim,
+            )
+        if not unavailable_roots:
+            claim = self._settle_directory_parent(
+                job_id,
+                staging_root,
+                claim,
+                allow_staged=True,
+            )
 
         job = self._required_job(job_id)
         if job.state is not expected_state:
@@ -170,8 +203,6 @@ class IntakeEngine:
             )
 
         source = source_candidate.resolve()
-        completed_root = self.config.completed_torrents.expanduser().resolve()
-
         if not self._is_within(source, completed_root):
             return self._attention(
                 job,
@@ -204,10 +235,17 @@ class IntakeEngine:
         return self._stage_single(job, source, staging_root, claim)
 
     def _recover_claimed(self, job_id: int, claim: JobClaim) -> IntakeResult:
-        staging_root = self.config.staging.expanduser().resolve()
+        completed_root, staging_root, unavailable_roots = self._media_roots()
+        if unavailable_roots:
+            return self._recovery_deferred(job_id, unavailable_roots)
         claim = self._renew(claim)
         pending_count, recovered_count, not_moved_count, attention_count = (
-            self._reconcile_pending_moves(job_id, staging_root, claim)
+            self._reconcile_pending_moves(
+                job_id,
+                completed_root,
+                staging_root,
+                claim,
+            )
         )
         claim = self._settle_directory_parent(
             job_id,
@@ -566,19 +604,24 @@ class IntakeEngine:
     def _reconcile_pending_moves(
         self,
         job_id: int,
+        completed_root: Path,
         staging_root: Path,
         claim: JobClaim,
     ) -> tuple[int, int, int, int]:
+        self._ensure_media_roots_available(completed_root, staging_root)
         operations = self.store.list_pending_move_operations(job_id)
         recovered_count = 0
         not_moved_count = 0
         attention_count = 0
 
         for operation in operations:
+            self._ensure_media_roots_available(completed_root, staging_root)
             claim = self._renew(claim)
-            validation_error = self._validate_recovery_destination(
-                operation, staging_root
-            )
+            validation_error = self._validate_recovery_source(operation, completed_root)
+            if validation_error is None:
+                validation_error = self._validate_recovery_destination(
+                    operation, staging_root
+                )
             source = operation.source_path
             destination = operation.destination_path
             if validation_error is not None:
@@ -591,7 +634,15 @@ class IntakeEngine:
                 attention_count += 1
                 continue
 
-            if source.is_symlink() or destination.is_symlink():
+            source_stat = self._probe_recovery_path(source, "source")
+            destination_stat = self._probe_recovery_path(destination, "destination")
+            if (
+                source_stat is not None
+                and stat.S_ISLNK(source_stat.st_mode)
+            ) or (
+                destination_stat is not None
+                and stat.S_ISLNK(destination_stat.st_mode)
+            ):
                 self.store.mark_move_needs_attention(
                     operation.id,
                     status_message=(
@@ -604,14 +655,16 @@ class IntakeEngine:
                 attention_count += 1
                 continue
 
-            source_exists = source.exists()
-            destination_exists = destination.exists()
+            source_exists = source_stat is not None
+            destination_exists = destination_stat is not None
+            self._ensure_media_roots_available(completed_root, staging_root)
 
             if source_exists and not destination_exists:
-                if not self._destination_matches(
+                if not self._recovery_fingerprint_matches(
                     source,
                     operation.source_size,
                     operation.source_sha256,
+                    "source",
                 ):
                     self.store.mark_move_needs_attention(
                         operation.id,
@@ -637,10 +690,11 @@ class IntakeEngine:
                 continue
 
             if not source_exists and destination_exists:
-                if not self._destination_matches(
+                if not self._recovery_fingerprint_matches(
                     destination,
                     operation.source_size,
                     operation.source_sha256,
+                    "destination",
                 ):
                     self.store.mark_move_needs_attention(
                         operation.id,
@@ -685,6 +739,79 @@ class IntakeEngine:
             attention_count += 1
 
         return len(operations), recovered_count, not_moved_count, attention_count
+
+    @staticmethod
+    def _probe_recovery_path(
+        path: Path,
+        label: str,
+    ) -> os.stat_result | None:
+        try:
+            return path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RecoveryDeferred(
+                f"Recovery deferred: could not inspect {label} path {path}: {exc}"
+            ) from exc
+
+    def _media_roots(self) -> tuple[Path, Path, tuple[str, ...]]:
+        completed_root = self._resolve_configured_root(self.config.completed_torrents)
+        staging_root = self._resolve_configured_root(self.config.staging)
+        unavailable: list[str] = []
+        for label, root in (
+            ("Completed Torrents", completed_root),
+            ("Staging", staging_root),
+        ):
+            try:
+                available = root.is_dir()
+            except OSError:
+                available = False
+            if not available:
+                unavailable.append(f"{label} ({root})")
+        return completed_root, staging_root, tuple(unavailable)
+
+    @staticmethod
+    def _resolve_configured_root(root: Path) -> Path:
+        candidate = root.expanduser()
+        try:
+            return candidate.resolve()
+        except (OSError, RuntimeError):
+            return candidate.absolute()
+
+    def _recovery_deferred(
+        self,
+        job_id: int,
+        unavailable_roots: tuple[str, ...],
+    ) -> IntakeResult:
+        job = self._required_job(job_id)
+        return IntakeResult(
+            job,
+            False,
+            "Recovery deferred: required media root unavailable: "
+            + ", ".join(unavailable_roots),
+        )
+
+    @staticmethod
+    def _ensure_media_roots_available(
+        completed_root: Path,
+        staging_root: Path,
+    ) -> None:
+        unavailable: list[str] = []
+        for label, root in (
+            ("Completed Torrents", completed_root),
+            ("Staging", staging_root),
+        ):
+            try:
+                available = root.is_dir()
+            except OSError:
+                available = False
+            if not available:
+                unavailable.append(f"{label} ({root})")
+        if unavailable:
+            raise RecoveryDeferred(
+                "Recovery deferred: required media root unavailable: "
+                + ", ".join(unavailable)
+            )
 
     def _settle_directory_parent(
         self,
@@ -793,10 +920,29 @@ class IntakeEngine:
             ):
                 return "Interrupted move destination escapes Staging; preserved source"
             resolved_destination = destination.resolve()
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             return f"Could not validate interrupted move destination: {exc}"
         if not IntakeEngine._is_within(resolved_destination, staging_root):
             return "Interrupted move destination resolves outside Staging; preserved paths"
+        return None
+
+    @staticmethod
+    def _validate_recovery_source(
+        operation: MoveOperation,
+        completed_root: Path,
+    ) -> str | None:
+        source = operation.source_path
+        try:
+            lexical_source = Path(os.path.abspath(source))
+            if not IntakeEngine._is_within(
+                lexical_source, Path(os.path.abspath(completed_root))
+            ):
+                return "Interrupted move source escapes Completed Torrents; preserved paths"
+            resolved_source = source.resolve()
+        except (OSError, RuntimeError) as exc:
+            return f"Could not validate interrupted move source: {exc}"
+        if not IntakeEngine._is_within(resolved_source, completed_root):
+            return "Interrupted move source resolves outside Completed Torrents; preserved paths"
         return None
 
     @staticmethod
@@ -822,6 +968,22 @@ class IntakeEngine:
             size, sha256 = cls._fingerprint(path)
         except OSError:
             return False
+        return size == expected_size and sha256 == expected_sha256
+
+    @classmethod
+    def _recovery_fingerprint_matches(
+        cls,
+        path: Path,
+        expected_size: int,
+        expected_sha256: str,
+        label: str,
+    ) -> bool:
+        try:
+            size, sha256 = cls._fingerprint(path)
+        except OSError as exc:
+            raise RecoveryDeferred(
+                f"Recovery deferred: could not read {label} path {path}: {exc}"
+            ) from exc
         return size == expected_size and sha256 == expected_sha256
 
     @staticmethod
