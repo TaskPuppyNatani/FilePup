@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry.add_argument("job_id", type=int)
 
+    recover = sub.add_parser(
+        "recover",
+        help="Reconcile interrupted filesystem moves for a job",
+    )
+    recover.add_argument("job_id", type=int)
+
     sub.add_parser("jobs", help="List known jobs")
     return parser
 
@@ -58,6 +64,11 @@ def main() -> None:
 
     if args.command == "retry":
         result = IntakeEngine(config, store).retry(args.job_id)
+        print(f"Job {result.job.id}: {result.job.state.value} - {result.message}")
+        return
+
+    if args.command == "recover":
+        result = IntakeEngine(config, store).recover(args.job_id)
         print(f"Job {result.job.id}: {result.job.state.value} - {result.message}")
         return
 

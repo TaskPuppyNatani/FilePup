@@ -543,3 +543,10 @@ def test_cli_exposes_explicit_retry_command() -> None:
 
     assert args.command == "retry"
     assert args.job_id == 42
+
+
+def test_cli_exposes_explicit_recover_command() -> None:
+    args = build_parser().parse_args(["recover", "42"])
+
+    assert args.command == "recover"
+    assert args.job_id == 42

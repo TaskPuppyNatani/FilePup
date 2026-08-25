@@ -1,8 +1,9 @@
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
-from .database import JobStore
-from .jobs import JobFile, JobFileState
+from .database import JobBusyError, JobStore
+from .jobs import JobClaim, JobFile, JobFileState
 
 
 VIDEO_EXTENSIONS = {
@@ -56,7 +57,25 @@ class InventoryEngine:
     def __init__(self, store: JobStore):
         self.store = store
 
-    def inventory(self, job_id: int) -> InventoryResult:
+    def inventory(
+        self,
+        job_id: int,
+        *,
+        claim: JobClaim | None = None,
+    ) -> InventoryResult:
+        if claim is not None:
+            return self._inventory(job_id, claim)
+
+        with self.store.job_lock(job_id):
+            owned_claim = self.store.claim_job(job_id, uuid4().hex)
+            if owned_claim is None:
+                raise JobBusyError(f"Job {job_id} is already claimed")
+            try:
+                return self._inventory(job_id, owned_claim)
+            finally:
+                self.store.release_job_claim(owned_claim)
+
+    def _inventory(self, job_id: int, claim: JobClaim) -> InventoryResult:
         job = self.store.get_job(job_id)
         if job is None:
             raise ValueError(f"Unknown job id: {job_id}")
@@ -84,8 +103,14 @@ class InventoryEngine:
                     )
                 )
 
-        files = self.store.replace_job_files(job_id, records)
-        supported = sum(file.state is JobFileState.DISCOVERED for file in files)
+        files = self.store.replace_job_files(job_id, records, claim=claim)
+        supported_states = {
+            JobFileState.DISCOVERED,
+            JobFileState.MOVING,
+            JobFileState.STAGED,
+            JobFileState.NEEDS_ATTENTION,
+        }
+        supported = sum(file.state in supported_states for file in files)
         ignored = sum(file.state is JobFileState.IGNORED for file in files)
         return InventoryResult(files, supported, ignored)
 

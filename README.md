@@ -44,6 +44,8 @@ Implemented:
 - deletion hard-disabled
 - safe single-file and per-file directory staging
 - explicit retry/resume for partially staged jobs
+- durable move journaling with evidence-based crash recovery
+- per-job process claims and crash-releasable locks
 - basic tests
 - systemd service template
 - Linux media path configuration
@@ -74,6 +76,33 @@ supported children. A remaining conflict or duplicate keeps the parent in
 `NEEDS_ATTENTION`; once every supported child is `STAGED`, the parent advances
 to `STAGED`. Unsupported files remain preserved in the source directory and do
 not block the supported-media result. Source deletion remains hard-disabled.
+
+Before any source-removing rename, FilePup persists a `PREPARED` move journal
+record containing both paths and a SHA-256 fingerprint. The journal advances
+through filesystem rename and database finalization. If a worker stops between
+those boundaries, use:
+
+```bash
+filepupctl recover <job_id>
+```
+
+Recovery marks a move `STAGED` only when the source is absent and the existing
+destination matches the recorded fingerprint. A source-only state is recorded
+as not moved; both paths or neither path are kept and marked for attention.
+Recovery never overwrites or deletes either copy, and completed journal rows
+remain as audit history. Staging, retry, and inventory operations use a
+per-job lock plus a leased/fenced SQLite claim so different jobs can proceed
+independently while stale claims remain reclaimable.
+
+The durable move lifecycle is:
+
+| Journal phase | Meaning | Recovery action |
+| --- | --- | --- |
+| `PREPARED` | Intent and source fingerprint committed; rename may not have run | Probe both paths |
+| `RENAMED` | Rename was recorded; child/parent finalization is pending | Verify destination fingerprint |
+| `COMPLETED` | Filesystem and database state agree | Preserve as audit history |
+| `NOT_MOVED` | Source still matched and destination was absent | Restore the prior child state |
+| `NEEDS_ATTENTION` | Both/neither/mismatched/unsafe paths | Preserve paths and require review |
 
 ## Development
 
