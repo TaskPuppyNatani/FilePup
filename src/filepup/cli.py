@@ -20,6 +20,12 @@ def build_parser() -> argparse.ArgumentParser:
     stage = sub.add_parser("stage", help="Move a discovered job safely into Staging")
     stage.add_argument("job_id", type=int)
 
+    retry = sub.add_parser(
+        "retry",
+        help="Retry unresolved files for a job that needs attention",
+    )
+    retry.add_argument("job_id", type=int)
+
     sub.add_parser("jobs", help="List known jobs")
     return parser
 
@@ -47,6 +53,11 @@ def main() -> None:
 
     if args.command == "stage":
         result = IntakeEngine(config, store).stage(args.job_id)
+        print(f"Job {result.job.id}: {result.job.state.value} - {result.message}")
+        return
+
+    if args.command == "retry":
+        result = IntakeEngine(config, store).retry(args.job_id)
         print(f"Job {result.job.id}: {result.job.state.value} - {result.message}")
         return
 

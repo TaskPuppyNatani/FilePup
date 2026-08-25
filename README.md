@@ -42,20 +42,38 @@ Implemented:
 - explicit job-state model
 - central `SafetyController`
 - deletion hard-disabled
+- safe single-file and per-file directory staging
+- explicit retry/resume for partially staged jobs
 - basic tests
 - systemd service template
 - Linux media path configuration
 
 Not implemented yet:
 
-- moving files from Completed_Torrents to Staging
 - media classification
 - HandBrake monitoring/integration
 - output verification
-- duplicate/conflict handling
 - source cleanup
 - Jellyfin refresh
 - GUI
+
+## Retry/resume implementation note
+
+`stage` is intentionally limited to `DISCOVERED` jobs. A failed or partially
+processed job enters `NEEDS_ATTENTION` and can be retried explicitly with:
+
+```bash
+filepupctl retry <job_id>
+```
+
+Retry re-checks the source, Completed Torrents boundary, Staging availability,
+destination safety, and post-move verification. For directory jobs it
+re-inventories without erasing historical `STAGED` or `NEEDS_ATTENTION` child
+rows, skips `STAGED` and `IGNORED` children, and retries only unresolved
+supported children. A remaining conflict or duplicate keeps the parent in
+`NEEDS_ATTENTION`; once every supported child is `STAGED`, the parent advances
+to `STAGED`. Unsupported files remain preserved in the source directory and do
+not block the supported-media result. Source deletion remains hard-disabled.
 
 ## Development
 
